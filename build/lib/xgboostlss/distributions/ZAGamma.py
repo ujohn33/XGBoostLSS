@@ -1,22 +1,26 @@
-from torch.distributions import Normal as Gaussian_Torch
+from .zero_inflated import ZeroAdjustedGamma as ZeroAdjustedGamma_Torch
 from .distribution_utils import DistributionClass
 from ..utils import *
 
 
-class Gaussian(DistributionClass):
+class ZAGamma(DistributionClass):
     """
-    Gaussian distribution class.
+    Zero-Adjusted Gamma distribution class.
 
-    Distributional Parameters
-    -------------------------
-    loc: torch.Tensor
-        Mean of the distribution (often referred to as mu).
-    scale: torch.Tensor
-        Standard deviation of the distribution (often referred to as sigma).
+    The zero-adjusted Gamma distribution is similar to the Gamma distribution but allows zeros as y values.
+
+     Distributional Parameters
+    --------------------------
+    concentration: torch.Tensor
+        shape parameter of the distribution (often referred to as alpha)
+    rate: torch.Tensor
+        rate = 1 / scale of the distribution (often referred to as beta)
+    gate: torch.Tensor
+        Probability of zeros given via a Bernoulli distribution.
 
     Source
     -------------------------
-    https://pytorch.org/docs/stable/distributions.html#normal
+    https://github.com/pyro-ppl/pyro/blob/dev/pyro/distributions/zero_inflated.py#L150
 
     Parameters
     -------------------------
@@ -26,24 +30,19 @@ class Gaussian(DistributionClass):
         Response function for transforming the distributional parameters to the correct support. Options are
         "exp" (exponential) or "softplus" (softplus).
     loss_fn: str
-        Loss function. Options are "nll" (negative log-likelihood) or "crps" (continuous ranked probability score).
-        Note that if "crps" is used, the Hessian is set to 1, as the current CRPS version is not twice differentiable.
-        Hence, using the CRPS disregards any variation in the curvature of the loss function.
+        Loss function. Options are "nll" (negative log-likelihood).
     """
     def __init__(self,
                  stabilization: str = "None",
                  response_fn: str = "exp",
-                 loss_fn: str = "nll",
-                 natural_gradient: bool = False,
-                 quantile_clipping: bool = False,
-                 clip_value: float = None,
+                 loss_fn: str = "nll"
                  ):
 
         # Input Checks
         if stabilization not in ["None", "MAD", "L2"]:
             raise ValueError("Invalid stabilization method. Please choose from 'None', 'MAD' or 'L2'.")
-        if loss_fn not in ["nll", "crps"]:
-            raise ValueError("Invalid loss function. Please choose from 'nll' or 'crps'.")
+        if loss_fn not in ["nll"]:
+            raise ValueError("Invalid loss function. Please select 'nll'.")
 
         # Specify Response Functions
         response_functions = {"exp": exp_fn, "softplus": softplus_fn}
@@ -54,8 +53,8 @@ class Gaussian(DistributionClass):
                 "Invalid response function. Please choose from 'exp' or 'softplus'.")
 
         # Set the parameters specific to the distribution
-        distribution = Gaussian_Torch
-        param_dict = {"loc": identity_fn, "scale": response_fn}
+        distribution = ZeroAdjustedGamma_Torch
+        param_dict = {"concentration": response_fn, "rate": response_fn, "gate": sigmoid_fn}
         torch.distributions.Distribution.set_default_validate_args(False)
 
         # Specify Distribution Class
@@ -66,8 +65,5 @@ class Gaussian(DistributionClass):
                          stabilization=stabilization,
                          param_dict=param_dict,
                          distribution_arg_names=list(param_dict.keys()),
-                         loss_fn=loss_fn,
-                         natural_gradient=natural_gradient,
-                         quantile_clipping=quantile_clipping,
-                         clip_value=clip_value,
+                         loss_fn=loss_fn
                          )

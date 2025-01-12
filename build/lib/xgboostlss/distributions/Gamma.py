@@ -1,22 +1,22 @@
-from torch.distributions import Normal as Gaussian_Torch
+from torch.distributions import Gamma as Gamma_Torch
 from .distribution_utils import DistributionClass
 from ..utils import *
 
 
-class Gaussian(DistributionClass):
+class Gamma(DistributionClass):
     """
-    Gaussian distribution class.
+    Gamma distribution class.
 
-    Distributional Parameters
-    -------------------------
-    loc: torch.Tensor
-        Mean of the distribution (often referred to as mu).
-    scale: torch.Tensor
-        Standard deviation of the distribution (often referred to as sigma).
+     Distributional Parameters
+    --------------------------
+    concentration: torch.Tensor
+        shape parameter of the distribution (often referred to as alpha)
+    rate: torch.Tensor
+        rate = 1 / scale of the distribution (often referred to as beta)
 
     Source
     -------------------------
-    https://pytorch.org/docs/stable/distributions.html#normal
+    https://pytorch.org/docs/stable/distributions.html#gamma
 
     Parameters
     -------------------------
@@ -33,10 +33,7 @@ class Gaussian(DistributionClass):
     def __init__(self,
                  stabilization: str = "None",
                  response_fn: str = "exp",
-                 loss_fn: str = "nll",
-                 natural_gradient: bool = False,
-                 quantile_clipping: bool = False,
-                 clip_value: float = None,
+                 loss_fn: str = "nll"
                  ):
 
         # Input Checks
@@ -54,8 +51,8 @@ class Gaussian(DistributionClass):
                 "Invalid response function. Please choose from 'exp' or 'softplus'.")
 
         # Set the parameters specific to the distribution
-        distribution = Gaussian_Torch
-        param_dict = {"loc": identity_fn, "scale": response_fn}
+        distribution = Gamma_Torch
+        param_dict = {"concentration": response_fn, "rate": response_fn}
         torch.distributions.Distribution.set_default_validate_args(False)
 
         # Specify Distribution Class
@@ -66,8 +63,5 @@ class Gaussian(DistributionClass):
                          stabilization=stabilization,
                          param_dict=param_dict,
                          distribution_arg_names=list(param_dict.keys()),
-                         loss_fn=loss_fn,
-                         natural_gradient=natural_gradient,
-                         quantile_clipping=quantile_clipping,
-                         clip_value=clip_value,
+                         loss_fn=loss_fn
                          )

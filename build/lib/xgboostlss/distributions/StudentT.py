@@ -1,24 +1,26 @@
-from torch.distributions import Normal as Gaussian_Torch
+from torch.distributions import StudentT as StudentT_Torch
 from .distribution_utils import DistributionClass
 from ..utils import *
 
 
-class Gaussian(DistributionClass):
+class StudentT(DistributionClass):
     """
-    Gaussian distribution class.
+    Student-T Distribution Class
 
     Distributional Parameters
     -------------------------
+    df: torch.Tensor
+        Degrees of freedom.
     loc: torch.Tensor
-        Mean of the distribution (often referred to as mu).
+        Mean of the distribution.
     scale: torch.Tensor
-        Standard deviation of the distribution (often referred to as sigma).
+        Scale of the distribution.
 
     Source
     -------------------------
-    https://pytorch.org/docs/stable/distributions.html#normal
+    https://pytorch.org/docs/stable/distributions.html#studentt
 
-    Parameters
+     Parameters
     -------------------------
     stabilization: str
         Stabilization method for the Gradient and Hessian. Options are "None", "MAD", "L2".
@@ -33,10 +35,7 @@ class Gaussian(DistributionClass):
     def __init__(self,
                  stabilization: str = "None",
                  response_fn: str = "exp",
-                 loss_fn: str = "nll",
-                 natural_gradient: bool = False,
-                 quantile_clipping: bool = False,
-                 clip_value: float = None,
+                 loss_fn: str = "nll"
                  ):
 
         # Input Checks
@@ -46,16 +45,19 @@ class Gaussian(DistributionClass):
             raise ValueError("Invalid loss function. Please choose from 'nll' or 'crps'.")
 
         # Specify Response Functions
-        response_functions = {"exp": exp_fn, "softplus": softplus_fn}
+        response_functions = {
+            "exp": (exp_fn, exp_fn_df),
+            "softplus": (softplus_fn, softplus_fn_df)
+        }
         if response_fn in response_functions:
-            response_fn = response_functions[response_fn]
+            response_fn, response_fn_df = response_functions[response_fn]
         else:
             raise ValueError(
                 "Invalid response function. Please choose from 'exp' or 'softplus'.")
 
         # Set the parameters specific to the distribution
-        distribution = Gaussian_Torch
-        param_dict = {"loc": identity_fn, "scale": response_fn}
+        distribution = StudentT_Torch
+        param_dict = {"df": response_fn_df, "loc": identity_fn, "scale": response_fn}
         torch.distributions.Distribution.set_default_validate_args(False)
 
         # Specify Distribution Class
@@ -66,8 +68,5 @@ class Gaussian(DistributionClass):
                          stabilization=stabilization,
                          param_dict=param_dict,
                          distribution_arg_names=list(param_dict.keys()),
-                         loss_fn=loss_fn,
-                         natural_gradient=natural_gradient,
-                         quantile_clipping=quantile_clipping,
-                         clip_value=clip_value,
+                         loss_fn=loss_fn
                          )

@@ -1,4 +1,5 @@
 import torch
+from torch.distributions import Categorical, MixtureSameFamily
 from torch.autograd import grad as autograd
 from torch.optim import LBFGS
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -13,15 +14,67 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
 
+from xgboostlss import distributions
 
-class DistributionClass:
+
+# Get all distribution names
+def get_component_distributions():
     """
-    Generic class that contains general functions for univariate distributions.
+    Function that returns component distributions for creating a mixing distribution.
+
+    Arguments
+    ---------
+    None
+
+    Returns
+    -------
+    distns: List
+        List of all available distributions.
+    """
+    # Get all distribution names
+    mixture_distns = [dist for dist in dir(distributions) if dist[0].isupper()]
+
+    # Remove specific distributions
+    distns_remove = [
+        "Dirichlet",
+        "Expectile",
+        "MVN",
+        "MVN_LoRa",
+        "MVT",
+        "Mixture",
+        "SplineFlow"
+    ]
+
+    mixture_distns = [item for item in mixture_distns if item not in distns_remove]
+
+    return mixture_distns
+
+
+class MixtureDistributionClass:
+    """
+    Generic class that contains general functions for mixed-density distributions.
 
     Arguments
     ---------
     distribution: torch.distributions.Distribution
         PyTorch Distribution class.
+    M: int
+        Number of components in the mixture distribution.
+    temperature: float
+        Temperature for the Gumbel-Softmax distribution.
+    hessian_mode: str
+        Mode for computing the Hessian. Must be one of the following:
+
+            - "individual": Each parameter is treated as a separate tensor. As a result, when the Hessian is calculated
+            for each gradient element, this corresponds to the second derivative with respect to that specific tensor
+            element only. This means the resulting Hessians capture the curvature of the loss w.r.t. each individual
+            parameter. This is usually more runtime intensive, but can also be more accurate.
+
+            - "grouped": Each parameter is a tensor containing all values for a specific parameter type,
+            e.g., loc, scale, or mixture probabilities for a Gaussian Mixture. When computing the Hessian for each
+            gradient element, the Hessian matrix for all the values in the respective tensor are calculated together.
+            The resulting Hessians capture the curvature of the loss w.r.t. the entire parameter type tensor. This is
+            usually less runtime intensive, but can be less accurate.
     univariate: bool
         Whether the distribution is univariate or multivariate.
     discrete: bool
@@ -35,36 +88,13 @@ class DistributionClass:
     distribution_arg_names: List
         List of distributional parameter names.
     loss_fn: str
-        Loss function. Options are "nll" (negative log-likelihood) or "crps" (continuous ranked probability score).
-        Note that if "crps" is used, the Hessian is set to 1, as the current CRPS version is not twice differentiable.
-        Hence, using the CRPS disregards any variation in the curvature of the loss function.
-    natural_gradient: bool
-        Specifies whether to use natural gradients instead of standard gradients
-        for optimization. Natural gradients scale the gradients by the inverse
-        of the Fisher Information Matrix (FIM), often leading to more stable and
-        efficient convergence. When set to True, natural gradients are applied;
-        otherwise, standard gradients are used.
-    quantile_clipping: bool 
-        Indicates whether to use quantile-based clipping for
-        gradients and Hessians during optimization. When set to True, the values of
-        gradients and Hessians are clipped based on specified quantile ranges (e.g.,
-        0.1 and 0.9), effectively removing extreme outliers while preserving most of
-        the data distribution. This approach dynamically adapts the clipping bounds
-        to the gradient distribution in each training step. 
-    clip_value: float
-        Defines the maximum absolute value for gradient and Hessian clipping.
-        Clipping helps to stabilize training by capping extreme values,
-        preventing issues like exploding gradients. When specified, gradients
-        are clipped to lie within the range [-clip_value, clip_value]. If not
-        provided, no clipping is applied, or alternative strategies (like
-        quantile-based clipping) might be used.
-    tau: List
-        List of expectiles. Only used for Expectile distributon.
-    penalize_crossing: bool
-        Whether to include a penalty term to discourage crossing of expectiles. Only used for Expectile distribution.
+        Loss function. Options are "nll" (negative log-likelihood).
     """
     def __init__(self,
                  distribution: torch.distributions.Distribution = None,
+                 M: int = 2,
+                 temperature: float = 1.0,
+                 hessian_mode: str = "individual",
                  univariate: bool = True,
                  discrete: bool = False,
                  n_dist_param: int = None,
@@ -72,14 +102,12 @@ class DistributionClass:
                  param_dict: Dict[str, Any] = None,
                  distribution_arg_names: List = None,
                  loss_fn: str = "nll",
-                 natural_gradient: bool = False,
-                 quantile_clipping: bool = False,
-                 clip_value: float = None,
-                 tau: Optional[List[torch.Tensor]] = None,
-                 penalize_crossing: bool = False,
                  ):
 
         self.distribution = distribution
+        self.M = M
+        self.temperature = temperature
+        self.hessian_mode = hessian_mode
         self.univariate = univariate
         self.discrete = discrete
         self.n_dist_param = n_dist_param
@@ -87,11 +115,6 @@ class DistributionClass:
         self.param_dict = param_dict
         self.distribution_arg_names = distribution_arg_names
         self.loss_fn = loss_fn
-        self.natural_gradient = natural_gradient
-        self.quantile_clipping = quantile_clipping
-        self.clip_value = clip_value
-        self.tau = tau
-        self.penalize_crossing = penalize_crossing
 
     def objective_fn(self, predt: np.ndarray, data: xgb.DMatrix) -> Tuple[np.ndarray, np.ndarray]:
 
@@ -113,12 +136,12 @@ class DistributionClass:
             Hessian.
         """
         # Target
-        target = torch.tensor(data.get_label().reshape(-1, 1))
+        target = torch.tensor(data.get_label().reshape(-1, 1), dtype=torch.float32)
 
         # Weights
         if data.get_weight().size == 0:
             # Use 1 as weight if no weights are specified
-            weights = torch.ones_like(target, dtype=target.dtype).numpy()
+            weights = np.ones_like(target, dtype="float32")
         else:
             weights = data.get_weight().reshape(-1, 1)
 
@@ -126,7 +149,7 @@ class DistributionClass:
         start_values = data.get_base_margin().reshape(-1, self.n_dist_param)[0, :].tolist()
 
         # Calculate gradients and hessians
-        predt, loss = self.get_params_loss(predt, target, start_values, requires_grad=True)
+        predt, loss = self.get_params_loss(predt, target.flatten(), start_values, requires_grad=True)
         grad, hess = self.compute_gradients_and_hessians(loss, predt, weights)
 
         return grad, hess
@@ -150,15 +173,39 @@ class DistributionClass:
             Loss value.
         """
         # Target
-        target = torch.tensor(data.get_label().reshape(-1, 1))
+        target = torch.tensor(data.get_label().reshape(-1, 1), dtype=torch.float32)
 
         # Start values (needed to replace NaNs in predt)
         start_values = data.get_base_margin().reshape(-1, self.n_dist_param)[0, :].tolist()
 
         # Calculate loss
-        _, loss = self.get_params_loss(predt, target, start_values, requires_grad=False)
+        _, loss = self.get_params_loss(predt, target.flatten(), start_values, requires_grad=False)
 
         return self.loss_fn, loss
+
+    def create_mixture_distribution(self,
+                                    params: List[torch.Tensor],
+                                    ) -> torch.distributions.Distribution:
+        """
+        Function that creates a mixture distribution.
+
+        Arguments
+        ---------
+        params: torch.Tensor
+            Distributional parameters.
+
+        Returns
+        -------
+        dist: torch.distributions.Distribution
+            Mixture distribution.
+        """
+
+        # Create Mixture Distribution
+        mixture_cat = Categorical(probs=params[-1])
+        mixture_comp = self.distribution.distribution(*params[:-1])
+        mixture_dist = MixtureSameFamily(mixture_cat, mixture_comp)
+
+        return mixture_dist
 
     def loss_fn_start_values(self,
                              params: torch.Tensor,
@@ -181,20 +228,15 @@ class DistributionClass:
         """
         # Replace NaNs and infinity values with 0.5
         nan_inf_idx = torch.isnan(torch.stack(params)) | torch.isinf(torch.stack(params))
-        params = torch.where(nan_inf_idx, torch.tensor(0.5), torch.stack(params))
+        params = torch.where(nan_inf_idx, torch.tensor(0.5), torch.stack(params)).reshape(1, -1)
+        params = torch.split(params, self.M, dim=1)
 
         # Transform parameters to response scale
-        params = [
-            response_fn(params[i].reshape(-1, 1)) for i, response_fn in enumerate(self.param_dict.values())
-        ]
+        params = [response_fn(params[i]) for i, response_fn in enumerate(self.param_dict.values())]
 
         # Specify Distribution and Loss
-        if self.tau is None:
-            dist = self.distribution(*params)
-            loss = -torch.nansum(dist.log_prob(target))
-        else:
-            dist = self.distribution(params, self.penalize_crossing)
-            loss = -torch.nansum(dist.log_prob(target, self.tau))
+        dist = self.create_mixture_distribution(params)
+        loss = -torch.nansum(dist.log_prob(target))
 
         return loss
 
@@ -220,7 +262,7 @@ class DistributionClass:
             Starting values for each distributional parameter.
         """
         # Convert target to torch.tensor
-        target = torch.tensor(target).reshape(-1, 1)
+        target = torch.tensor(target, dtype=torch.float32).flatten()
 
         # Initialize parameters
         params = [torch.tensor(0.5, requires_grad=True) for _ in range(self.n_dist_param)]
@@ -240,10 +282,26 @@ class DistributionClass:
 
         # Optimize parameters
         loss_vals = []
+        tolerance = 1e-5
+        patience = 5
+        best_loss = float("inf")
+        epochs_without_change = 0
+
         for epoch in range(max_iter):
+            optimizer.zero_grad()
             loss = optimizer.step(closure)
             lr_scheduler.step(loss)
             loss_vals.append(loss.item())
+
+            # Stopping criterion (no improvement in loss)
+            if loss.item() < best_loss - tolerance:
+                best_loss = loss.item()
+                epochs_without_change = 0
+            else:
+                epochs_without_change += 1
+
+            if epochs_without_change >= patience:
+                break
 
         # Get final loss
         loss = np.array(loss_vals[-1])
@@ -290,31 +348,32 @@ class DistributionClass:
         nan_inf_mask = np.isnan(predt) | np.isinf(predt)
         predt[nan_inf_mask] = np.take(start_values, np.where(nan_inf_mask)[1])
 
-        # Convert to torch.tensor
-        predt = [
-            torch.tensor(predt[:, i].reshape(-1, 1), requires_grad=requires_grad) for i in range(self.n_dist_param)
-        ]
+        if self.hessian_mode == "grouped":
+            # Convert to torch.Tensor: splits the parameters into tensors for each parameter-type
+            predt = torch.split(torch.tensor(predt, requires_grad=requires_grad), self.M, dim=1)
+            # Transform parameters to response scale
+            predt_transformed = [response_fn(predt[i]) for i, response_fn in enumerate(self.param_dict.values())]
 
-        # Predicted Parameters transformed to response scale
-        predt_transformed = [
-            response_fn(predt[i].reshape(-1, 1)) for i, response_fn in enumerate(self.param_dict.values())
-        ]
+        else:
+            # Convert to torch.Tensor: splits the parameters into tensors for each parameter individually
+            predt = torch.split(torch.tensor(predt, requires_grad=requires_grad), 1, dim=1)
+            # Transform parameters to response scale
+            keys = list(self.param_dict.keys())
+            max_index = len(self.param_dict) * self.M
+            index_ranges = []
+            for i in range(0, max_index, self.M):
+                if i + self.M >= max_index:
+                    index_ranges.append((i, None))
+                    break
+                index_ranges.append((i, i + self.M))
+
+            predt_transformed = []
+            for key, (start, end) in zip(keys, index_ranges):
+                predt_transformed.append(self.param_dict[key](torch.cat(predt[start:end], dim=1)))
 
         # Specify Distribution and Loss
-        if self.tau is None:
-            dist_kwargs = dict(zip(self.distribution_arg_names, predt_transformed))
-            dist_fit = self.distribution(**dist_kwargs)
-            if self.loss_fn == "nll":
-                loss = -torch.nansum(dist_fit.log_prob(target))
-            elif self.loss_fn == "crps":
-                torch.manual_seed(123)
-                dist_samples = dist_fit.rsample((30,)).squeeze(-1)
-                loss = torch.nansum(self.crps_score(target, dist_samples))
-            else:
-                raise ValueError("Invalid loss function. Please select 'nll' or 'crps'.")
-        else:
-            dist_fit = self.distribution(predt_transformed, self.penalize_crossing)
-            loss = -torch.nansum(dist_fit.log_prob(target, self.tau))
+        dist_fit = self.create_mixture_distribution(predt_transformed)
+        loss = -torch.nansum(dist_fit.log_prob(target))
 
         return predt, loss
 
@@ -343,15 +402,12 @@ class DistributionClass:
         """
         torch.manual_seed(seed)
 
-        if self.tau is None:
-            pred_params = torch.tensor(predt_params.values)
-            dist_kwargs = {arg_name: param for arg_name, param in zip(self.distribution_arg_names, pred_params.T)}
-            dist_pred = self.distribution(**dist_kwargs)
-            dist_samples = dist_pred.sample((n_samples,)).squeeze().detach().numpy().T
-            dist_samples = pd.DataFrame(dist_samples)
-            dist_samples.columns = [str("y_sample") + str(i) for i in range(dist_samples.shape[1])]
-        else:
-            dist_samples = None
+        pred_params = torch.tensor(predt_params.values).reshape(-1, self.n_dist_param)
+        pred_params = torch.split(pred_params, self.M, dim=1)
+        dist_pred = self.create_mixture_distribution(pred_params)
+        dist_samples = dist_pred.sample((n_samples,)).squeeze().detach().numpy().T
+        dist_samples = pd.DataFrame(dist_samples)
+        dist_samples.columns = [str("y_sample") + str(i) for i in range(dist_samples.shape[1])]
 
         if self.discrete:
             dist_samples = dist_samples.astype(int)
@@ -383,7 +439,6 @@ class DistributionClass:
             - "samples" draws n_samples from the predicted distribution.
             - "quantiles" calculates the quantiles from the predicted distribution.
             - "parameters" returns the predicted distributional parameters.
-            - "expectiles" returns the predicted expectiles.
         n_samples : int
             Number of samples to draw from the predicted distribution.
         quantiles : List[float]
@@ -397,23 +452,21 @@ class DistributionClass:
             Predictions.
         """
         # Set base_margin as starting point for each distributional parameter. Requires base_score=0 in parameters.
-        base_margin_test = (np.ones(shape=(data.num_row(), 1))) * start_values
-        data.set_base_margin(base_margin_test.flatten())
+        base_margin_predt = (np.ones(shape=(data.num_row(), 1))) * start_values
+        data.set_base_margin(base_margin_predt.flatten())
 
         predt = np.array(booster.predict(data, output_margin=True)).reshape(-1, self.n_dist_param)
-        predt = torch.tensor(predt, dtype=torch.float32)
+        predt = torch.split(torch.tensor(predt, dtype=torch.float32), self.M, dim=1)
 
         # Transform predicted parameters to response scale
         dist_params_predt = np.concatenate(
             [
-                response_fun(
-                    predt[:, i].reshape(-1, 1)).numpy() for i, (dist_param, response_fun) in
-                enumerate(self.param_dict.items())
+                response_fun(predt[i]).numpy() for i, (dist_param, response_fun) in enumerate(self.param_dict.items())
             ],
             axis=1,
         )
         dist_params_predt = pd.DataFrame(dist_params_predt)
-        dist_params_predt.columns = self.param_dict.keys()
+        dist_params_predt.columns = self.distribution_arg_names
 
         # Draw samples from predicted response distribution
         pred_samples_df = self.draw_samples(predt_params=dist_params_predt,
@@ -421,9 +474,6 @@ class DistributionClass:
                                             seed=seed)
 
         if pred_type == "parameters":
-            return dist_params_predt
-
-        elif pred_type == "expectiles":
             return dist_params_predt
 
         elif pred_type == "samples":
@@ -438,8 +488,8 @@ class DistributionClass:
             return pred_quant_df
 
     def compute_gradients_and_hessians(self,
-                                       loss: torch.tensor,
-                                       predt: torch.tensor,
+                                       loss: torch.Tensor,
+                                       predt: List[torch.Tensor],
                                        weights: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
         """
@@ -463,48 +513,9 @@ class DistributionClass:
         hess: torch.Tensor
             Hessians.
         """
-        if self.loss_fn == "nll":
-            # Gradient and Hessian
-            grad = autograd(loss, inputs=predt, create_graph=True)
-            hess = [autograd(grad[i].nansum(), inputs=predt[i], retain_graph=True)[0] for i in range(len(grad))]
-            if self.natural_gradient:
-                modified_hess = hess.copy()
-                n = predt[0].shape[0]
-                fim_diag_2 = torch.ones(n,1) * 2
-                modified_hess[1] = fim_diag_2.clone().detach()
-                grad = [grad[i] / modified_hess[i] for i in range(len(grad))]
-                #print(grad)
-            else:
-                pass
-        elif self.loss_fn == "crps":
-            # Gradient and Hessian
-            grad = autograd(loss, inputs=predt, create_graph=True)
-            hess = [torch.ones_like(grad[i]) for i in range(len(grad))]
-            if self.natural_gradient:
-                warnings.warn("Natural Gradient is not implemented for CRPS. Using standard Gradient instead.")
-            else:
-                pass
-        
-        if self.quantile_clipping:
-            # Clip Gradients and Hessians
-            # Ensure gradients and Hessians are detached before computing quantiles
-            grad_tensor = torch.cat([g.detach() for g in grad])
-            hess_tensor = torch.cat([h.detach() for h in hess])
-
-            grad_min = torch.quantile(grad_tensor, self.clip_value)
-            grad_max = torch.quantile(grad_tensor, 1 - self.clip_value)
-            hess_min = torch.quantile(hess_tensor, self.clip_value)
-            hess_max = torch.quantile(hess_tensor, 1 - self.clip_value)
-
-            # Clip Gradients and Hessians
-            grad = [torch.clamp(g, min=grad_min, max=grad_max) for g in grad]
-            hess = [torch.clamp(h, min=hess_min, max=hess_max) for h in hess]
-        elif self.clip_value is not None:
-            # Fixed-value Clipping
-            grad = [torch.clamp(g, min=-self.clip_value, max=self.clip_value) for g in grad]
-            hess = [torch.clamp(h, min=self.clip_value, max=1) for h in hess]
-        else:
-            pass
+        # Gradient and Hessian
+        grad = autograd(loss, inputs=predt, create_graph=True)
+        hess = [autograd(grad[i].nansum(), inputs=predt[i], retain_graph=True)[0] for i in range(len(grad))]
 
         # Stabilization of Derivatives
         if self.stabilization != "None":
@@ -512,8 +523,8 @@ class DistributionClass:
             hess = [self.stabilize_derivative(hess[i], type=self.stabilization) for i in range(len(hess))]
 
         # Reshape
-        grad = torch.cat(grad, axis=1).detach().numpy()
-        hess = torch.cat(hess, axis=1).detach().numpy()
+        grad = torch.cat(grad, axis=1).detach().squeeze(-1).numpy()
+        hess = torch.cat(hess, axis=1).detach().squeeze(-1).numpy()
 
         # Weighting
         grad *= weights
@@ -568,67 +579,12 @@ class DistributionClass:
 
         return stab_der
 
-
-    def crps_score(self, y: torch.tensor, yhat_dist: torch.tensor) -> torch.tensor:
-        """
-        Function that calculates the Continuous Ranked Probability Score (CRPS) for a given set of predicted samples.
-
-        Parameters
-        ----------
-        y: torch.Tensor
-            Response variable of shape (n_observations,1).
-        yhat_dist: torch.Tensor
-            Predicted samples of shape (n_samples, n_observations).
-
-        Returns
-        -------
-        crps: torch.Tensor
-            CRPS score.
-
-        References
-        ----------
-        Gneiting, Tilmann & Raftery, Adrian. (2007). Strictly Proper Scoring Rules, Prediction, and Estimation.
-        Journal of the American Statistical Association. 102. 359-378.
-
-        Source
-        ------
-        https://github.com/elephaint/pgbm/blob/main/pgbm/torch/pgbm_dist.py#L549
-        """
-        # Get the number of observations
-        n_samples = yhat_dist.shape[0]
-
-        # Sort the forecasts in ascending order
-        yhat_dist_sorted, _ = torch.sort(yhat_dist, 0)
-
-        # Create temporary tensors
-        y_cdf = torch.zeros_like(y)
-        yhat_cdf = torch.zeros_like(y)
-        yhat_prev = torch.zeros_like(y)
-        crps = torch.zeros_like(y)
-
-        # Loop over the predicted samples generated per observation
-        for yhat in yhat_dist_sorted:
-            yhat = yhat.reshape(-1, 1)
-            flag = (y_cdf == 0) * (y < yhat)
-            crps += flag * ((y - yhat_prev) * yhat_cdf ** 2)
-            crps += flag * ((yhat - y) * (yhat_cdf - 1) ** 2)
-            crps += (~flag) * ((yhat - yhat_prev) * (yhat_cdf - y_cdf) ** 2)
-            y_cdf += flag
-            yhat_cdf += 1 / n_samples
-            yhat_prev = yhat
-
-        # In case y_cdf == 0 after the loop
-        flag = (y_cdf == 0)
-        crps += flag * (y - yhat)
-
-        return crps
-
     def dist_select(self,
                     target: np.ndarray,
                     candidate_distributions: List,
                     max_iter: int = 100,
                     plot: bool = False,
-                    figure_size: tuple = (10, 5),
+                    figure_size: tuple = (8, 5),
                     ) -> pd.DataFrame:
         """
         Function that selects the most suitable distribution among the candidate_distributions for the target variable,
@@ -656,50 +612,55 @@ class DistributionClass:
         total_iterations = len(candidate_distributions)
         with tqdm(total=total_iterations, desc="Fitting candidate distributions") as pbar:
             for i in range(len(candidate_distributions)):
-                dist_name = candidate_distributions[i].__name__.split(".")[2]
+                dist_name = candidate_distributions[i].distribution.__class__.__name__
+                n_mix = candidate_distributions[i].M
+                tau = candidate_distributions[i].temperature
+                dist_name = f"Mixture({dist_name}, tau={tau}, M={n_mix})"
                 pbar.set_description(f"Fitting {dist_name} distribution")
-                dist_sel = getattr(candidate_distributions[i], dist_name)()
                 try:
-                    loss, params = dist_sel.calculate_start_values(target=target.reshape(-1, 1), max_iter=max_iter)
+                    loss, params = candidate_distributions[i].calculate_start_values(target=target, max_iter=max_iter)
                     fit_df = pd.DataFrame.from_dict(
-                        {self.loss_fn: loss.reshape(-1,),
+                        {candidate_distributions[i].loss_fn: loss.reshape(-1, ),
                          "distribution": str(dist_name),
-                         "params": [params]
+                         "params": [params],
+                         "dist_pos": i,
+                         "M": candidate_distributions[i].M
                          }
                     )
                 except Exception as e:
                     warnings.warn(f"Error fitting {dist_name} distribution: {str(e)}")
                     fit_df = pd.DataFrame(
-                        {self.loss_fn: np.nan,
+                        {candidate_distributions[i].loss_fn: np.nan,
                          "distribution": str(dist_name),
-                         "params": [np.nan] * self.n_dist_param
+                         "params": [np.nan] * self.n_dist_param,
+                         "dist_pos": i,
+                         "M": candidate_distributions[i].M
                          }
                     )
                 dist_list.append(fit_df)
                 pbar.update(1)
             pbar.set_description(f"Fitting of candidate distributions completed")
-            fit_df = pd.concat(dist_list).sort_values(by=self.loss_fn, ascending=True)
-            fit_df["rank"] = fit_df[self.loss_fn].rank().astype(int)
+            fit_df = pd.concat(dist_list).sort_values(by=candidate_distributions[i].loss_fn, ascending=True)
+            fit_df["rank"] = fit_df[candidate_distributions[i].loss_fn].rank().astype(int)
             fit_df.set_index(fit_df["rank"], inplace=True)
+
         if plot:
             # Select best distribution
-            best_dist = fit_df[fit_df["rank"] == 1].reset_index(drop=True)
-            for dist in candidate_distributions:
-                if dist.__name__.split(".")[2] == best_dist["distribution"].values[0]:
-                    best_dist_sel = dist
-                    break
-            best_dist_sel = getattr(best_dist_sel, best_dist["distribution"].values[0])()
-            params = torch.tensor(best_dist["params"][0]).reshape(-1, best_dist_sel.n_dist_param)
+            best_dist = fit_df[fit_df["rank"] == fit_df["rank"].min()].reset_index(drop=True).iloc[[0]]
+            best_dist_pos = int(best_dist["dist_pos"].values[0])
+            best_dist_sel = candidate_distributions[best_dist_pos]
+            params = torch.tensor(best_dist["params"][0]).reshape(1, -1)
+            params = torch.split(params, best_dist_sel.M, dim=1)
 
-            # Transform parameters to the response scale and draw samples
             fitted_params = np.concatenate(
                 [
-                    response_fun(params[:, i].reshape(-1, 1)).numpy()
+                    response_fun(params[i]).numpy()
                     for i, (dist_param, response_fun) in enumerate(best_dist_sel.param_dict.items())
                 ],
                 axis=1,
             )
-            fitted_params = pd.DataFrame(fitted_params, columns=best_dist_sel.param_dict.keys())
+
+            fitted_params = pd.DataFrame(fitted_params, columns=best_dist_sel.distribution_arg_names)
             n_samples = np.max([10000, target.shape[0]])
             n_samples = np.where(n_samples > 500000, 100000, n_samples)
             dist_samples = best_dist_sel.draw_samples(fitted_params,
@@ -708,12 +669,12 @@ class DistributionClass:
 
             # Plot actual and fitted distribution
             plt.figure(figsize=figure_size)
-            sns.kdeplot(target.reshape(-1, ), label="Actual")
-            sns.kdeplot(dist_samples.reshape(-1, ), label=f"Best-Fit: {best_dist['distribution'].values[0]}")
+            sns.kdeplot(target.reshape(-1,), label="Actual")
+            sns.kdeplot(dist_samples.reshape(-1,), label=f"Best-Fit: {best_dist['distribution'].values[0]}")
             plt.legend()
             plt.title("Actual vs. Best-Fit Density", fontweight="bold", fontsize=16)
             plt.show()
 
-        fit_df.drop(columns=["rank", "params"], inplace=True)
+        fit_df.drop(columns=["rank", "params", "dist_pos", "M"], inplace=True)
 
         return fit_df

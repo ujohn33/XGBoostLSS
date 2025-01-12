@@ -38,26 +38,6 @@ class DistributionClass:
         Loss function. Options are "nll" (negative log-likelihood) or "crps" (continuous ranked probability score).
         Note that if "crps" is used, the Hessian is set to 1, as the current CRPS version is not twice differentiable.
         Hence, using the CRPS disregards any variation in the curvature of the loss function.
-    natural_gradient: bool
-        Specifies whether to use natural gradients instead of standard gradients
-        for optimization. Natural gradients scale the gradients by the inverse
-        of the Fisher Information Matrix (FIM), often leading to more stable and
-        efficient convergence. When set to True, natural gradients are applied;
-        otherwise, standard gradients are used.
-    quantile_clipping: bool 
-        Indicates whether to use quantile-based clipping for
-        gradients and Hessians during optimization. When set to True, the values of
-        gradients and Hessians are clipped based on specified quantile ranges (e.g.,
-        0.1 and 0.9), effectively removing extreme outliers while preserving most of
-        the data distribution. This approach dynamically adapts the clipping bounds
-        to the gradient distribution in each training step. 
-    clip_value: float
-        Defines the maximum absolute value for gradient and Hessian clipping.
-        Clipping helps to stabilize training by capping extreme values,
-        preventing issues like exploding gradients. When specified, gradients
-        are clipped to lie within the range [-clip_value, clip_value]. If not
-        provided, no clipping is applied, or alternative strategies (like
-        quantile-based clipping) might be used.
     tau: List
         List of expectiles. Only used for Expectile distributon.
     penalize_crossing: bool
@@ -73,8 +53,6 @@ class DistributionClass:
                  distribution_arg_names: List = None,
                  loss_fn: str = "nll",
                  natural_gradient: bool = False,
-                 quantile_clipping: bool = False,
-                 clip_value: float = None,
                  tau: Optional[List[torch.Tensor]] = None,
                  penalize_crossing: bool = False,
                  ):
@@ -88,8 +66,6 @@ class DistributionClass:
         self.distribution_arg_names = distribution_arg_names
         self.loss_fn = loss_fn
         self.natural_gradient = natural_gradient
-        self.quantile_clipping = quantile_clipping
-        self.clip_value = clip_value
         self.tau = tau
         self.penalize_crossing = penalize_crossing
 
@@ -484,27 +460,6 @@ class DistributionClass:
                 warnings.warn("Natural Gradient is not implemented for CRPS. Using standard Gradient instead.")
             else:
                 pass
-        
-        if self.quantile_clipping:
-            # Clip Gradients and Hessians
-            # Ensure gradients and Hessians are detached before computing quantiles
-            grad_tensor = torch.cat([g.detach() for g in grad])
-            hess_tensor = torch.cat([h.detach() for h in hess])
-
-            grad_min = torch.quantile(grad_tensor, self.clip_value)
-            grad_max = torch.quantile(grad_tensor, 1 - self.clip_value)
-            hess_min = torch.quantile(hess_tensor, self.clip_value)
-            hess_max = torch.quantile(hess_tensor, 1 - self.clip_value)
-
-            # Clip Gradients and Hessians
-            grad = [torch.clamp(g, min=grad_min, max=grad_max) for g in grad]
-            hess = [torch.clamp(h, min=hess_min, max=hess_max) for h in hess]
-        elif self.clip_value is not None:
-            # Fixed-value Clipping
-            grad = [torch.clamp(g, min=-self.clip_value, max=self.clip_value) for g in grad]
-            hess = [torch.clamp(h, min=self.clip_value, max=1) for h in hess]
-        else:
-            pass
 
         # Stabilization of Derivatives
         if self.stabilization != "None":

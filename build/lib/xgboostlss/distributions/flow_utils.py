@@ -2,6 +2,8 @@ import torch
 from torch.autograd import grad as autograd
 from torch.optim import LBFGS
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from pyro.distributions import TransformedDistribution
+from pyro.distributions.transforms import Transform
 
 import xgboost as xgb
 import numpy as np
@@ -14,89 +16,79 @@ import seaborn as sns
 import warnings
 
 
-class DistributionClass:
+class NormalizingFlowClass:
     """
-    Generic class that contains general functions for univariate distributions.
+    Generic class that contains general functions for normalizing flows.
 
     Arguments
     ---------
-    distribution: torch.distributions.Distribution
-        PyTorch Distribution class.
-    univariate: bool
-        Whether the distribution is univariate or multivariate.
-    discrete: bool
-        Whether the support of the distribution is discrete or continuous.
+    base_dist: torch.distributions.Distribution
+        PyTorch Distribution class. Currently only Normal is supported.
+    flow_transform: Transform
+        Specify the normalizing flow transform.
+    count_bins: Optional[int]
+        The number of segments comprising the spline. Only used if flow_transform is Spline.
+    bound: Optional[float]
+        The quantity "K" determining the bounding box, [-K,K] x [-K,K] of the spline. By adjusting the
+        "K" value, you can control the size of the bounding box and consequently control the range of inputs that
+        the spline transform operates on. Larger values of "K" will result in a wider valid range for the spline
+        transformation, while smaller values will restrict the valid range to a smaller region. Should be chosen
+        based on the range of the data. Only used if flow_transform is Spline.
+    order: Optional[str]
+        The order of the spline. Options are "linear" or "quadratic". Only used if flow_transform is Spline.
     n_dist_param: int
-        Number of distributional parameters.
-    stabilization: str
-        Stabilization method.
+        Number of parameters.
     param_dict: Dict[str, Any]
-        Dictionary that maps distributional parameters to their response scale.
+        Dictionary that maps parameters to their response scale.
     distribution_arg_names: List
         List of distributional parameter names.
+    target_transform: Transform
+        Specify the target transform.
+    discrete: bool
+        Whether the target is discrete or not.
+    univariate: bool
+        Whether the distribution is univariate or multivariate.
+    stabilization: str
+        Stabilization method. Options are "None", "MAD" or "L2".
     loss_fn: str
         Loss function. Options are "nll" (negative log-likelihood) or "crps" (continuous ranked probability score).
         Note that if "crps" is used, the Hessian is set to 1, as the current CRPS version is not twice differentiable.
         Hence, using the CRPS disregards any variation in the curvature of the loss function.
-    natural_gradient: bool
-        Specifies whether to use natural gradients instead of standard gradients
-        for optimization. Natural gradients scale the gradients by the inverse
-        of the Fisher Information Matrix (FIM), often leading to more stable and
-        efficient convergence. When set to True, natural gradients are applied;
-        otherwise, standard gradients are used.
-    quantile_clipping: bool 
-        Indicates whether to use quantile-based clipping for
-        gradients and Hessians during optimization. When set to True, the values of
-        gradients and Hessians are clipped based on specified quantile ranges (e.g.,
-        0.1 and 0.9), effectively removing extreme outliers while preserving most of
-        the data distribution. This approach dynamically adapts the clipping bounds
-        to the gradient distribution in each training step. 
-    clip_value: float
-        Defines the maximum absolute value for gradient and Hessian clipping.
-        Clipping helps to stabilize training by capping extreme values,
-        preventing issues like exploding gradients. When specified, gradients
-        are clipped to lie within the range [-clip_value, clip_value]. If not
-        provided, no clipping is applied, or alternative strategies (like
-        quantile-based clipping) might be used.
-    tau: List
-        List of expectiles. Only used for Expectile distributon.
-    penalize_crossing: bool
-        Whether to include a penalty term to discourage crossing of expectiles. Only used for Expectile distribution.
     """
     def __init__(self,
-                 distribution: torch.distributions.Distribution = None,
-                 univariate: bool = True,
-                 discrete: bool = False,
+                 base_dist: torch.distributions.Distribution = None,
+                 flow_transform: Transform = None,
+                 count_bins: Optional[int] = 8,
+                 bound: Optional[float] = 3.0,
+                 order: Optional[str] = "quadratic",
                  n_dist_param: int = None,
-                 stabilization: str = "None",
                  param_dict: Dict[str, Any] = None,
                  distribution_arg_names: List = None,
+                 target_transform: Transform = None,
+                 discrete: bool = False,
+                 univariate: bool = True,
+                 stabilization: str = "None",
                  loss_fn: str = "nll",
-                 natural_gradient: bool = False,
-                 quantile_clipping: bool = False,
-                 clip_value: float = None,
-                 tau: Optional[List[torch.Tensor]] = None,
-                 penalize_crossing: bool = False,
                  ):
 
-        self.distribution = distribution
-        self.univariate = univariate
-        self.discrete = discrete
+        self.base_dist = base_dist
+        self.flow_transform = flow_transform
+        self.count_bins = count_bins
+        self.bound = bound
+        self.order = order
         self.n_dist_param = n_dist_param
-        self.stabilization = stabilization
         self.param_dict = param_dict
         self.distribution_arg_names = distribution_arg_names
+        self.target_transform = target_transform
+        self.discrete = discrete
+        self.univariate = univariate
+        self.stabilization = stabilization
         self.loss_fn = loss_fn
-        self.natural_gradient = natural_gradient
-        self.quantile_clipping = quantile_clipping
-        self.clip_value = clip_value
-        self.tau = tau
-        self.penalize_crossing = penalize_crossing
 
     def objective_fn(self, predt: np.ndarray, data: xgb.DMatrix) -> Tuple[np.ndarray, np.ndarray]:
 
         """
-        Function to estimate gradients and hessians of distributional parameters.
+        Function to estimate gradients and hessians of normalizing flow parameters.
 
         Arguments
         ---------
@@ -126,7 +118,7 @@ class DistributionClass:
         start_values = data.get_base_margin().reshape(-1, self.n_dist_param)[0, :].tolist()
 
         # Calculate gradients and hessians
-        predt, loss = self.get_params_loss(predt, target, start_values, requires_grad=True)
+        predt, loss = self.get_params_loss(predt, target, start_values)
         grad, hess = self.compute_gradients_and_hessians(loss, predt, weights)
 
         return grad, hess
@@ -156,54 +148,16 @@ class DistributionClass:
         start_values = data.get_base_margin().reshape(-1, self.n_dist_param)[0, :].tolist()
 
         # Calculate loss
-        _, loss = self.get_params_loss(predt, target, start_values, requires_grad=False)
+        _, loss = self.get_params_loss(predt, target, start_values)
 
         return self.loss_fn, loss
-
-    def loss_fn_start_values(self,
-                             params: torch.Tensor,
-                             target: torch.Tensor) -> torch.Tensor:
-        """
-        Function that calculates the loss for a given set of distributional parameters. Only used for calculating
-        the loss for the start values.
-
-        Parameter
-        ---------
-        params: torch.Tensor
-            Distributional parameters.
-        target: torch.Tensor
-            Target values.
-
-        Returns
-        -------
-        loss: torch.Tensor
-            Loss value.
-        """
-        # Replace NaNs and infinity values with 0.5
-        nan_inf_idx = torch.isnan(torch.stack(params)) | torch.isinf(torch.stack(params))
-        params = torch.where(nan_inf_idx, torch.tensor(0.5), torch.stack(params))
-
-        # Transform parameters to response scale
-        params = [
-            response_fn(params[i].reshape(-1, 1)) for i, response_fn in enumerate(self.param_dict.values())
-        ]
-
-        # Specify Distribution and Loss
-        if self.tau is None:
-            dist = self.distribution(*params)
-            loss = -torch.nansum(dist.log_prob(target))
-        else:
-            dist = self.distribution(params, self.penalize_crossing)
-            loss = -torch.nansum(dist.log_prob(target, self.tau))
-
-        return loss
 
     def calculate_start_values(self,
                                target: np.ndarray,
                                max_iter: int = 50
                                ) -> Tuple[float, np.ndarray]:
         """
-        Function that calculates the starting values for each distributional parameter.
+        Function that calculates starting values for each parameter.
 
         Arguments
         ---------
@@ -217,39 +171,60 @@ class DistributionClass:
         loss: float
             Loss value.
         start_values: np.ndarray
-            Starting values for each distributional parameter.
+            Starting values for each parameter.
         """
         # Convert target to torch.tensor
         target = torch.tensor(target).reshape(-1, 1)
 
-        # Initialize parameters
-        params = [torch.tensor(0.5, requires_grad=True) for _ in range(self.n_dist_param)]
+        # Create Normalizing Flow
+        flow_dist = self.create_spline_flow(input_dim=1)
 
         # Specify optimizer
-        optimizer = LBFGS(params, lr=0.1, max_iter=np.min([int(max_iter/4), 20]), line_search_fn="strong_wolfe")
+        optimizer = LBFGS(flow_dist.transforms[0].parameters(),
+                          lr=0.3,
+                          max_iter=np.min([int(max_iter/4), 50]),
+                          line_search_fn="strong_wolfe")
 
         # Define learning rate scheduler
-        lr_scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
+        lr_scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
 
         # Define closure
         def closure():
             optimizer.zero_grad()
-            loss = self.loss_fn_start_values(params, target)
+            loss = -torch.nansum(flow_dist.log_prob(target))
             loss.backward()
+            flow_dist.clear_cache()
             return loss
 
         # Optimize parameters
         loss_vals = []
+        tolerance = 1e-5           # Tolerance level for loss change
+        patience = 5               # Patience level for loss change
+        best_loss = float("inf")
+        epochs_without_change = 0
+
         for epoch in range(max_iter):
+            optimizer.zero_grad()
             loss = optimizer.step(closure)
             lr_scheduler.step(loss)
             loss_vals.append(loss.item())
+
+            # Stopping criterion (no improvement in loss)
+            if loss.item() < best_loss - tolerance:
+                best_loss = loss.item()
+                epochs_without_change = 0
+            else:
+                epochs_without_change += 1
+
+            if epochs_without_change >= patience:
+                break
 
         # Get final loss
         loss = np.array(loss_vals[-1])
 
         # Get start values
-        start_values = np.array([params[i].detach() for i in range(self.n_dist_param)])
+        start_values = list(flow_dist.transforms[0].parameters())
+        start_values = torch.cat([param.view(-1) for param in start_values]).detach().numpy()
 
         # Replace any remaining NaNs or infinity values with 0.5
         start_values = np.nan_to_num(start_values, nan=0.5, posinf=0.5, neginf=0.5)
@@ -272,17 +247,18 @@ class DistributionClass:
         target: torch.Tensor
             Target values.
         start_values: List
-            Starting values for each distributional parameter.
-        requires_grad: bool
-            Whether to add to the computational graph or not.
+            Starting values for each parameter.
 
         Returns
         -------
-        predt: List of torch.Tensors
+        predt: torch.Tensor
             Predicted parameters.
         loss: torch.Tensor
             Loss value.
         """
+        # Reshape Target
+        target = target.view(-1)
+
         # Predicted Parameters
         predt = predt.reshape(-1, self.n_dist_param)
 
@@ -291,32 +267,100 @@ class DistributionClass:
         predt[nan_inf_mask] = np.take(start_values, np.where(nan_inf_mask)[1])
 
         # Convert to torch.tensor
-        predt = [
-            torch.tensor(predt[:, i].reshape(-1, 1), requires_grad=requires_grad) for i in range(self.n_dist_param)
-        ]
+        predt = torch.tensor(predt, dtype=torch.float32)
 
-        # Predicted Parameters transformed to response scale
-        predt_transformed = [
-            response_fn(predt[i].reshape(-1, 1)) for i, response_fn in enumerate(self.param_dict.values())
-        ]
+        # Specify Normalizing Flow
+        flow_dist = self.create_spline_flow(target.shape[0])
 
-        # Specify Distribution and Loss
-        if self.tau is None:
-            dist_kwargs = dict(zip(self.distribution_arg_names, predt_transformed))
-            dist_fit = self.distribution(**dist_kwargs)
-            if self.loss_fn == "nll":
-                loss = -torch.nansum(dist_fit.log_prob(target))
-            elif self.loss_fn == "crps":
-                torch.manual_seed(123)
-                dist_samples = dist_fit.rsample((30,)).squeeze(-1)
-                loss = torch.nansum(self.crps_score(target, dist_samples))
-            else:
-                raise ValueError("Invalid loss function. Please select 'nll' or 'crps'.")
+        # Replace parameters with estimated ones
+        params, flow_dist = self.replace_parameters(predt, flow_dist)
+
+        # Calculate loss
+        if self.loss_fn == "nll":
+            loss = -torch.nansum(flow_dist.log_prob(target))
+        elif self.loss_fn == "crps":
+            torch.manual_seed(123)
+            dist_samples = flow_dist.rsample((30,)).squeeze(-1)
+            loss = torch.nansum(self.crps_score(target, dist_samples))
         else:
-            dist_fit = self.distribution(predt_transformed, self.penalize_crossing)
-            loss = -torch.nansum(dist_fit.log_prob(target, self.tau))
+            raise ValueError("Invalid loss function. Please select 'nll' or 'crps'.")
 
-        return predt, loss
+        return params, loss
+
+    def create_spline_flow(self,
+                           input_dim: int = None,
+                           ) -> Transform:
+
+        """
+        Function that constructs a Normalizing Flow.
+
+        Arguments
+        ---------
+        input_dim: int
+            Input dimension.
+
+        Returns
+        -------
+        spline_flow: Transform
+            Normalizing Flow.
+        """
+
+        # Create flow distribution (currently only Normal)
+        loc, scale = torch.zeros(input_dim), torch.ones(input_dim)
+        flow_dist = self.base_dist(loc, scale)
+
+        # Create Spline Transform
+        torch.manual_seed(123)
+        spline_transform = self.flow_transform(input_dim,
+                                               count_bins=self.count_bins,
+                                               bound=self.bound,
+                                               order=self.order)
+
+        # Create Normalizing Flow
+        spline_flow = TransformedDistribution(flow_dist, [spline_transform, self.target_transform])
+
+        return spline_flow
+
+    def replace_parameters(self,
+                           params: torch.Tensor,
+                           flow_dist: Transform,
+                           ) -> Tuple[List, Transform]:
+        """
+        Replace parameters with estimated ones.
+
+        Arguments
+        ---------
+        params: torch.Tensor
+            Estimated parameters.
+        flow_dist: Transform
+            Normalizing Flow.
+
+        Returns
+        -------
+        params_list: List
+            List of estimated parameters.
+        flow_dist: Transform
+            Normalizing Flow with estimated parameters.
+        """
+
+        # Split parameters into list
+        if self.order == "quadratic":
+            params_list = torch.split(
+                params, [self.count_bins, self.count_bins, self.count_bins - 1],
+                dim=1)
+        elif self.order == "linear":
+            params_list = torch.split(
+                params, [self.count_bins, self.count_bins, self.count_bins - 1, self.count_bins],
+                dim=1)
+
+        # Replace parameters
+        for param, new_value in zip(flow_dist.transforms[0].parameters(), params_list):
+            param.data = new_value
+
+        # Get parameters (including require_grad=True)
+        params_list = list(flow_dist.transforms[0].parameters())
+
+        return params_list, flow_dist
 
     def draw_samples(self,
                      predt_params: pd.DataFrame,
@@ -341,22 +385,24 @@ class DistributionClass:
             DataFrame with n_samples drawn from predicted response distribution.
 
         """
+
         torch.manual_seed(seed)
 
-        if self.tau is None:
-            pred_params = torch.tensor(predt_params.values)
-            dist_kwargs = {arg_name: param for arg_name, param in zip(self.distribution_arg_names, pred_params.T)}
-            dist_pred = self.distribution(**dist_kwargs)
-            dist_samples = dist_pred.sample((n_samples,)).squeeze().detach().numpy().T
-            dist_samples = pd.DataFrame(dist_samples)
-            dist_samples.columns = [str("y_sample") + str(i) for i in range(dist_samples.shape[1])]
-        else:
-            dist_samples = None
+        # Specify Normalizing Flow
+        pred_params = torch.tensor(predt_params.values)
+        flow_dist_pred = self.create_spline_flow(pred_params.shape[0])
+
+        # Replace parameters with estimated ones
+        _, flow_dist_pred = self.replace_parameters(pred_params, flow_dist_pred)
+
+        # Draw samples
+        flow_samples = pd.DataFrame(flow_dist_pred.sample((n_samples,)).squeeze().detach().numpy().T)
+        flow_samples.columns = [str("y_sample") + str(i) for i in range(flow_samples.shape[1])]
 
         if self.discrete:
-            dist_samples = dist_samples.astype(int)
+            flow_samples = flow_samples.astype(int)
 
-        return dist_samples
+        return flow_samples
 
     def predict_dist(self,
                      booster: xgb.Booster,
@@ -365,7 +411,7 @@ class DistributionClass:
                      pred_type: str = "parameters",
                      n_samples: int = 1000,
                      quantiles: list = [0.1, 0.5, 0.9],
-                     seed: str = 123
+                     seed: int = 123
                      ) -> pd.DataFrame:
         """
         Function that predicts from the trained model.
@@ -383,7 +429,6 @@ class DistributionClass:
             - "samples" draws n_samples from the predicted distribution.
             - "quantiles" calculates the quantiles from the predicted distribution.
             - "parameters" returns the predicted distributional parameters.
-            - "expectiles" returns the predicted expectiles.
         n_samples : int
             Number of samples to draw from the predicted distribution.
         quantiles : List[float]
@@ -397,22 +442,13 @@ class DistributionClass:
             Predictions.
         """
         # Set base_margin as starting point for each distributional parameter. Requires base_score=0 in parameters.
-        base_margin_test = (np.ones(shape=(data.num_row(), 1))) * start_values
-        data.set_base_margin(base_margin_test.flatten())
+        base_margin_predt = (np.ones(shape=(data.num_row(), 1))) * start_values
+        data.set_base_margin(base_margin_predt.flatten())
 
-        predt = np.array(booster.predict(data, output_margin=True)).reshape(-1, self.n_dist_param)
-        predt = torch.tensor(predt, dtype=torch.float32)
-
-        # Transform predicted parameters to response scale
-        dist_params_predt = np.concatenate(
-            [
-                response_fun(
-                    predt[:, i].reshape(-1, 1)).numpy() for i, (dist_param, response_fun) in
-                enumerate(self.param_dict.items())
-            ],
-            axis=1,
+        # Predict distributional parameters
+        dist_params_predt = pd.DataFrame(
+            np.array(booster.predict(data, output_margin=True)).reshape(-1, self.n_dist_param)
         )
-        dist_params_predt = pd.DataFrame(dist_params_predt)
         dist_params_predt.columns = self.param_dict.keys()
 
         # Draw samples from predicted response distribution
@@ -421,9 +457,6 @@ class DistributionClass:
                                             seed=seed)
 
         if pred_type == "parameters":
-            return dist_params_predt
-
-        elif pred_type == "expectiles":
             return dist_params_predt
 
         elif pred_type == "samples":
@@ -467,44 +500,10 @@ class DistributionClass:
             # Gradient and Hessian
             grad = autograd(loss, inputs=predt, create_graph=True)
             hess = [autograd(grad[i].nansum(), inputs=predt[i], retain_graph=True)[0] for i in range(len(grad))]
-            if self.natural_gradient:
-                modified_hess = hess.copy()
-                n = predt[0].shape[0]
-                fim_diag_2 = torch.ones(n,1) * 2
-                modified_hess[1] = fim_diag_2.clone().detach()
-                grad = [grad[i] / modified_hess[i] for i in range(len(grad))]
-                #print(grad)
-            else:
-                pass
         elif self.loss_fn == "crps":
             # Gradient and Hessian
             grad = autograd(loss, inputs=predt, create_graph=True)
             hess = [torch.ones_like(grad[i]) for i in range(len(grad))]
-            if self.natural_gradient:
-                warnings.warn("Natural Gradient is not implemented for CRPS. Using standard Gradient instead.")
-            else:
-                pass
-        
-        if self.quantile_clipping:
-            # Clip Gradients and Hessians
-            # Ensure gradients and Hessians are detached before computing quantiles
-            grad_tensor = torch.cat([g.detach() for g in grad])
-            hess_tensor = torch.cat([h.detach() for h in hess])
-
-            grad_min = torch.quantile(grad_tensor, self.clip_value)
-            grad_max = torch.quantile(grad_tensor, 1 - self.clip_value)
-            hess_min = torch.quantile(hess_tensor, self.clip_value)
-            hess_max = torch.quantile(hess_tensor, 1 - self.clip_value)
-
-            # Clip Gradients and Hessians
-            grad = [torch.clamp(g, min=grad_min, max=grad_max) for g in grad]
-            hess = [torch.clamp(h, min=hess_min, max=hess_max) for h in hess]
-        elif self.clip_value is not None:
-            # Fixed-value Clipping
-            grad = [torch.clamp(g, min=-self.clip_value, max=self.clip_value) for g in grad]
-            hess = [torch.clamp(h, min=self.clip_value, max=1) for h in hess]
-        else:
-            pass
 
         # Stabilization of Derivatives
         if self.stabilization != "None":
@@ -529,23 +528,26 @@ class DistributionClass:
         """
         Function that stabilizes Gradients and Hessians.
 
-        As XGBoostLSS updates the parameter estimates by optimizing Gradients and Hessians, it is important
-        that these are comparable in magnitude for all distributional parameters. Due to imbalances regarding the ranges,
-        the estimation might become unstable so that it does not converge (or converge very slowly) to the optimal solution.
-        Another way to improve convergence might be to standardize the response variable. This is especially useful if the
-        range of the response differs strongly from the range of the Gradients and Hessians. Both, the stabilization and
-        the standardization of the response are not always advised but need to be carefully considered.
-        Source: https://github.com/boost-R/gamboostLSS/blob/7792951d2984f289ed7e530befa42a2a4cb04d1d/R/helpers.R#L173
+        Since parameters are estimated by optimizing Gradients and Hessians, it is important that these are comparable
+        in magnitude for all parameters. Due to imbalances regarding the ranges, the estimation might become unstable
+        so that it does not converge (or converge very slowly) to the optimal solution. Another way to improve
+        convergence might be to standardize the response variable. This is especially useful if the range of the
+        response differs strongly from the range of the Gradients and Hessians. Both, the stabilization and the
+        standardization of the response are not always advised but need to be carefully considered.
 
-        Parameters
-        ----------
+        Source
+        ---------
+        https://github.com/boost-R/gamboostLSS/blob/7792951d2984f289ed7e530befa42a2a4cb04d1d/R/helpers.R#L173
+
+        Arguments
+        ---------
         input_der : torch.Tensor
             Input derivative, either Gradient or Hessian.
         type: str
             Stabilization method. Can be either "None", "MAD" or "L2".
 
         Returns
-        -------
+        ---------
         stab_der : torch.Tensor
             Stabilized Gradient or Hessian.
         """
@@ -568,30 +570,29 @@ class DistributionClass:
 
         return stab_der
 
-
     def crps_score(self, y: torch.tensor, yhat_dist: torch.tensor) -> torch.tensor:
         """
         Function that calculates the Continuous Ranked Probability Score (CRPS) for a given set of predicted samples.
 
-        Parameters
-        ----------
+        Arguments
+        ---------
         y: torch.Tensor
             Response variable of shape (n_observations,1).
         yhat_dist: torch.Tensor
             Predicted samples of shape (n_samples, n_observations).
 
         Returns
-        -------
+        ---------
         crps: torch.Tensor
             CRPS score.
 
         References
-        ----------
+        ---------
         Gneiting, Tilmann & Raftery, Adrian. (2007). Strictly Proper Scoring Rules, Prediction, and Estimation.
         Journal of the American Statistical Association. 102. 359-378.
 
         Source
-        ------
+        ---------
         https://github.com/elephaint/pgbm/blob/main/pgbm/torch/pgbm_dist.py#L549
         """
         # Get the number of observations
@@ -623,23 +624,23 @@ class DistributionClass:
 
         return crps
 
-    def dist_select(self,
+    def flow_select(self,
                     target: np.ndarray,
-                    candidate_distributions: List,
+                    candidate_flows: List,
                     max_iter: int = 100,
                     plot: bool = False,
                     figure_size: tuple = (10, 5),
                     ) -> pd.DataFrame:
         """
-        Function that selects the most suitable distribution among the candidate_distributions for the target variable,
-        based on the NegLogLikelihood (lower is better).
+        Function that selects the most suitable normalizing flow specification among the candidate_flow for the
+        target variable, based on the NegLogLikelihood (lower is better).
 
         Parameters
         ----------
         target: np.ndarray
             Response variable.
-        candidate_distributions: List
-            List of candidate distributions.
+        candidate_flows: List
+            List of candidate normalizing flow specifications.
         max_iter: int
             Maximum number of iterations for the optimization.
         plot: bool
@@ -650,66 +651,63 @@ class DistributionClass:
         Returns
         -------
         fit_df: pd.DataFrame
-            Dataframe with the loss values of the fitted candidate distributions.
+            Dataframe with the loss values of the fitted normalizing flow.
         """
-        dist_list = []
-        total_iterations = len(candidate_distributions)
-        with tqdm(total=total_iterations, desc="Fitting candidate distributions") as pbar:
-            for i in range(len(candidate_distributions)):
-                dist_name = candidate_distributions[i].__name__.split(".")[2]
-                pbar.set_description(f"Fitting {dist_name} distribution")
-                dist_sel = getattr(candidate_distributions[i], dist_name)()
+        flow_list = []
+        total_iterations = len(candidate_flows)
+
+        with tqdm(total=total_iterations, desc="Fitting candidate normalizing flows") as pbar:
+            for flow in candidate_flows:
+                flow_name = str(flow.__class__).split(".")[-1].split("'>")[0]
+                flow_spec = f"(count_bins: {flow.count_bins}, order: {flow.order})"
+                flow_name = flow_name + flow_spec
+                pbar.set_description(f"Fitting {flow_name}")
+                flow_sel = flow
                 try:
-                    loss, params = dist_sel.calculate_start_values(target=target.reshape(-1, 1), max_iter=max_iter)
+                    loss, params = flow_sel.calculate_start_values(target=target, max_iter=max_iter)
                     fit_df = pd.DataFrame.from_dict(
-                        {self.loss_fn: loss.reshape(-1,),
-                         "distribution": str(dist_name),
+                        {flow_sel.loss_fn: loss.reshape(-1, ),
+                         "NormFlow": str(flow_name),
                          "params": [params]
                          }
                     )
                 except Exception as e:
-                    warnings.warn(f"Error fitting {dist_name} distribution: {str(e)}")
+                    warnings.warn(f"Error fitting {flow_sel} NormFlow: {str(e)}")
                     fit_df = pd.DataFrame(
-                        {self.loss_fn: np.nan,
-                         "distribution": str(dist_name),
-                         "params": [np.nan] * self.n_dist_param
+                        {flow_sel.loss_fn: np.nan,
+                         "NormFlow": str(flow_sel),
+                         "params": [np.nan] * flow_sel.n_dist_param
                          }
                     )
-                dist_list.append(fit_df)
+                flow_list.append(fit_df)
                 pbar.update(1)
-            pbar.set_description(f"Fitting of candidate distributions completed")
-            fit_df = pd.concat(dist_list).sort_values(by=self.loss_fn, ascending=True)
-            fit_df["rank"] = fit_df[self.loss_fn].rank().astype(int)
+            pbar.set_description(f"Fitting of candidate normalizing flows completed")
+            fit_df = pd.concat(flow_list).sort_values(by=flow_sel.loss_fn, ascending=True)
+            fit_df["rank"] = fit_df[flow_sel.loss_fn].rank().astype(int)
             fit_df.set_index(fit_df["rank"], inplace=True)
         if plot:
-            # Select best distribution
-            best_dist = fit_df[fit_df["rank"] == 1].reset_index(drop=True)
-            for dist in candidate_distributions:
-                if dist.__name__.split(".")[2] == best_dist["distribution"].values[0]:
-                    best_dist_sel = dist
+            # Select normalizing flow with the lowest loss
+            best_flow = fit_df[fit_df["rank"] == 1].reset_index(drop=True)
+            for flow in candidate_flows:
+                flow_name = str(flow.__class__).split(".")[-1].split("'>")[0]
+                flow_spec = f"(count_bins: {flow.count_bins}, order: {flow.order})"
+                flow_name = flow_name + flow_spec
+                if flow_name == best_flow["NormFlow"].values[0]:
+                    best_flow_sel = flow
                     break
-            best_dist_sel = getattr(best_dist_sel, best_dist["distribution"].values[0])()
-            params = torch.tensor(best_dist["params"][0]).reshape(-1, best_dist_sel.n_dist_param)
 
-            # Transform parameters to the response scale and draw samples
-            fitted_params = np.concatenate(
-                [
-                    response_fun(params[:, i].reshape(-1, 1)).numpy()
-                    for i, (dist_param, response_fun) in enumerate(best_dist_sel.param_dict.items())
-                ],
-                axis=1,
-            )
-            fitted_params = pd.DataFrame(fitted_params, columns=best_dist_sel.param_dict.keys())
+            # Draw samples from distribution
+            flow_params = torch.tensor(best_flow["params"][0]).reshape(1, -1)
+            flow_dist_sel = best_flow_sel.create_spline_flow(input_dim=1)
+            _, flow_dist_sel = best_flow_sel.replace_parameters(flow_params, flow_dist_sel)
             n_samples = np.max([10000, target.shape[0]])
             n_samples = np.where(n_samples > 500000, 100000, n_samples)
-            dist_samples = best_dist_sel.draw_samples(fitted_params,
-                                                      n_samples=n_samples,
-                                                      seed=123).values
+            flow_samples = pd.DataFrame(flow_dist_sel.sample((n_samples,)).squeeze().detach().numpy().T).values
 
             # Plot actual and fitted distribution
             plt.figure(figsize=figure_size)
             sns.kdeplot(target.reshape(-1, ), label="Actual")
-            sns.kdeplot(dist_samples.reshape(-1, ), label=f"Best-Fit: {best_dist['distribution'].values[0]}")
+            sns.kdeplot(flow_samples.reshape(-1, ), label=f"Best-Fit: {best_flow['NormFlow'].values[0]}")
             plt.legend()
             plt.title("Actual vs. Best-Fit Density", fontweight="bold", fontsize=16)
             plt.show()
