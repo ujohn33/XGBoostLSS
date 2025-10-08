@@ -1,3 +1,4 @@
+import torch
 from torch.distributions import Dirichlet as Dirichlet_Torch
 from .multivariate_distribution_utils import Multivariate_DistributionClass
 from ..utils import *

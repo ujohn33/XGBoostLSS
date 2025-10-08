@@ -1,3 +1,4 @@
+import torch
 from pyro.distributions import MultivariateStudentT as MultivariateStudentT_Torch
 from .multivariate_distribution_utils import Multivariate_DistributionClass
 from ..utils import *

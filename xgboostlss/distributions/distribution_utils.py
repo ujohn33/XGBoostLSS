@@ -44,20 +44,12 @@ class DistributionClass:
         of the Fisher Information Matrix (FIM), often leading to more stable and
         efficient convergence. When set to True, natural gradients are applied;
         otherwise, standard gradients are used.
-    quantile_clipping: bool 
-        Indicates whether to use quantile-based clipping for
-        gradients and Hessians during optimization. When set to True, the values of
-        gradients and Hessians are clipped based on specified quantile ranges (e.g.,
-        0.1 and 0.9), effectively removing extreme outliers while preserving most of
-        the data distribution. This approach dynamically adapts the clipping bounds
-        to the gradient distribution in each training step. 
     clip_value: float
         Defines the maximum absolute value for gradient and Hessian clipping.
         Clipping helps to stabilize training by capping extreme values,
         preventing issues like exploding gradients. When specified, gradients
         are clipped to lie within the range [-clip_value, clip_value]. If not
-        provided, no clipping is applied, or alternative strategies (like
-        quantile-based clipping) might be used.
+        provided, no clipping is applied.
     tau: List
         List of expectiles. Only used for Expectile distributon.
     penalize_crossing: bool
@@ -73,7 +65,6 @@ class DistributionClass:
                  distribution_arg_names: List = None,
                  loss_fn: str = "nll",
                  natural_gradient: bool = False,
-                 quantile_clipping: bool = False,
                  clip_value: float = None,
                  tau: Optional[List[torch.Tensor]] = None,
                  penalize_crossing: bool = False,
@@ -88,7 +79,6 @@ class DistributionClass:
         self.distribution_arg_names = distribution_arg_names
         self.loss_fn = loss_fn
         self.natural_gradient = natural_gradient
-        self.quantile_clipping = quantile_clipping
         self.clip_value = clip_value
         self.tau = tau
         self.penalize_crossing = penalize_crossing
@@ -485,21 +475,7 @@ class DistributionClass:
             else:
                 pass
         
-        if self.quantile_clipping:
-            # Clip Gradients and Hessians
-            # Ensure gradients and Hessians are detached before computing quantiles
-            grad_tensor = torch.cat([g.detach() for g in grad])
-            hess_tensor = torch.cat([h.detach() for h in hess])
-
-            grad_min = torch.quantile(grad_tensor, self.clip_value)
-            grad_max = torch.quantile(grad_tensor, 1 - self.clip_value)
-            hess_min = torch.quantile(hess_tensor, self.clip_value)
-            hess_max = torch.quantile(hess_tensor, 1 - self.clip_value)
-
-            # Clip Gradients and Hessians
-            grad = [torch.clamp(g, min=grad_min, max=grad_max) for g in grad]
-            hess = [torch.clamp(h, min=hess_min, max=hess_max) for h in hess]
-        elif self.clip_value is not None:
+        if self.clip_value is not None:
             # Fixed-value Clipping
             grad = [torch.clamp(g, min=-self.clip_value, max=self.clip_value) for g in grad]
             hess = [torch.clamp(h, min=self.clip_value, max=1) for h in hess]
@@ -717,3 +693,173 @@ class DistributionClass:
         fit_df.drop(columns=["rank", "params"], inplace=True)
 
         return fit_df
+
+    def evaluate_nll(self, 
+                     predt_params: pd.DataFrame, 
+                     target: np.ndarray) -> float:
+        """
+        Evaluates the Negative Log-Likelihood (NLL) of predictions.
+        
+        Arguments
+        ---------
+        predt_params: pd.DataFrame
+            DataFrame with predicted distributional parameters.
+        target: np.ndarray
+            Target values.
+            
+        Returns
+        -------
+        nll: float
+            Negative log-likelihood.
+        """
+        # Convert target to torch.tensor
+        target = torch.tensor(target).reshape(-1, 1)
+        
+        # Convert predicted parameters to torch.tensor
+        pred_params = torch.tensor(predt_params.values)
+        
+        if self.tau is None:
+            # Initialize distribution with predicted parameters
+            dist_kwargs = {arg_name: param for arg_name, param in zip(self.distribution_arg_names, pred_params.T)}
+            dist_pred = self.distribution(**dist_kwargs)
+            
+            # Calculate NLL
+            nll = -torch.mean(dist_pred.log_prob(target)).item()
+        else:
+            dist_pred = self.distribution([torch.tensor(predt_params[col].values).reshape(-1, 1) 
+                                         for col in predt_params.columns], 
+                                         self.penalize_crossing)
+            nll = -torch.mean(dist_pred.log_prob(target, self.tau)).item()
+            
+        return nll
+    
+    def evaluate_crps(self, 
+                      predt_params: pd.DataFrame, 
+                      target: np.ndarray,
+                      n_samples: int = 1000,
+                      seed: int = 123) -> Tuple[float, float, float]:
+        """
+        Evaluates the Continuous Ranked Probability Score (CRPS) of predictions.
+        
+        Arguments
+        ---------
+        predt_params: pd.DataFrame
+            DataFrame with predicted distributional parameters.
+        target: np.ndarray
+            Target values.
+        n_samples: int
+            Number of samples to draw from predicted distribution for CRPS calculation.
+        seed: int
+            Random seed for reproducibility.
+            
+        Returns
+        -------
+        crps: Tuple[float, float, float]
+            Tuple containing (CRPS, CRPS_calibration, CRPS_sharpness)
+        """
+        # Draw samples from predicted distribution
+        samples_df = self.draw_samples(predt_params=predt_params,
+                                      n_samples=n_samples,
+                                      seed=seed)
+        
+        # Reshape samples for CRPS calculation
+        samples = samples_df.values
+        
+        # Calculate CRPS components
+        y_true = target.flatten()
+        crps_values = np.zeros(len(y_true))
+        crps_calibration = np.zeros(len(y_true))
+        crps_sharpness = np.zeros(len(y_true))
+        
+        for i in range(len(y_true)):
+            # Calculate CRPS for each observation
+            sample_i = samples[i, :]
+            crps_i = self._crps_single(y_true[i], sample_i)
+            crps_values[i] = crps_i[0]
+            crps_calibration[i] = crps_i[1]
+            crps_sharpness[i] = crps_i[2]
+        
+        # Return mean values
+        return (np.mean(crps_values), np.mean(crps_calibration), np.mean(crps_sharpness))
+    
+    def _crps_single(self, 
+                    observation: float, 
+                    samples: np.ndarray) -> Tuple[float, float, float]:
+        """
+        Calculate CRPS for a single observation.
+        
+        Arguments
+        ---------
+        observation: float
+            True observation.
+        samples: np.ndarray
+            Samples from predicted distribution.
+            
+        Returns
+        -------
+        crps: Tuple[float, float, float]
+            (CRPS, CRPS_calibration, CRPS_sharpness)
+        """
+        # Sort samples
+        samples = np.sort(samples)
+        n_samples = len(samples)
+        
+        # Calculate empirical CDF
+        positions = np.arange(1, n_samples + 1) / n_samples
+        
+        # Heaviside function (1 if x >= 0, 0 otherwise)
+        heaviside = np.heaviside(observation - samples, 0.5)
+        
+        # CRPS components
+        calibration = np.mean((heaviside - positions) ** 2)
+        sharpness = np.mean(np.abs(samples - np.mean(samples)))
+        crps = calibration + sharpness
+        
+        return (crps, calibration, sharpness)
+    
+    def evaluate_quantile_loss(self,
+                               predt_params: pd.DataFrame,
+                               target: np.ndarray,
+                               quantiles: List[float] = [0.1, 0.5, 0.9]) -> Dict[str, float]:
+        """
+        Calculates quantile loss for specified quantiles.
+        
+        Arguments
+        ---------
+        predt_params: pd.DataFrame
+            DataFrame with predicted distributional parameters.
+        target: np.ndarray
+            Target values.
+        quantiles: List[float]
+            List of quantiles to evaluate.
+            
+        Returns
+        -------
+        quantile_losses: Dict[str, float]
+            Dictionary mapping quantile values to their respective losses.
+        """
+        # Convert to torch tensors
+        target = target.flatten()
+        pred_params = torch.tensor(predt_params.values)
+        
+        # Initialize distribution with predicted parameters
+        dist_kwargs = {arg_name: param for arg_name, param in zip(self.distribution_arg_names, pred_params.T)}
+        dist_pred = self.distribution(**dist_kwargs)
+        
+        # Calculate quantile predictions and losses
+        quantile_losses = {}
+        for q in quantiles:
+            # Get quantile predictions
+            quantile_preds = dist_pred.icdf(torch.tensor(q)).detach().numpy().flatten()
+            
+            # Calculate quantile loss: q * (y - pred) if y > pred else (1-q) * (pred - y)
+            errors = target - quantile_preds
+            losses = np.where(errors >= 0, q * errors, (q - 1) * errors)
+            
+            # Store mean loss
+            quantile_losses[str(q)] = np.mean(np.abs(losses))
+            
+        # Add average across all quantiles
+        quantile_losses['avg'] = np.mean(list(quantile_losses.values()))
+        
+        return quantile_losses

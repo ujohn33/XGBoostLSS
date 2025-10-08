@@ -402,6 +402,13 @@ class XGBoostLSS:
                                                        log=param_log
                                                        )
                          })
+                else:
+                    raise ValueError("Invalid parameter type. Please choose from 'categorical', 'float' or 'int'.")
+                
+                if param_name == "clip_value":
+                    print(f"clip_value: {hyper_params[param_name]}")
+                    self.dist.clip_value = hyper_params[param_name]
+                    del hyper_params[param_name]
 
             # Add booster if not included in dictionary
             if "booster" not in hyper_params.keys():
